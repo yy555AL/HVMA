@@ -316,150 +316,550 @@ class CrossAttention(nn.Module):
         return output
 
 
+class SpatialAzimuthTokenEncoding(nn.Module):
+    """
+    Lightweight spatial-azimuth encoding for visual tokens.
+
+    It encodes:
+        x, y              : normalized spatial coordinates
+        dist              : distance to image center
+        sin(theta), cos(theta): azimuth-angle cues
+
+    gamma is initialized as 0, so this module is initially an identity mapping.
+    """
+
+    def __init__(self, dim):
+        super().__init__()
+
+        self.proj = nn.Sequential(
+            nn.Linear(5, dim, bias=False),
+            nn.GELU(),
+            nn.Linear(dim, dim, bias=False)
+        )
+
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x, spatial_shape=None):
+        """
+        Args:
+            x: [B, N, D]
+            spatial_shape: optional tuple (H, W)
+
+        Returns:
+            x with spatial-azimuth encoding: [B, N, D]
+        """
+        B, N, D = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        if spatial_shape is None:
+            H = int(math.sqrt(N))
+            W = H
+            if H * W != N:
+                raise ValueError(
+                    f"Cannot infer spatial shape from N={N}. "
+                    f"Please provide spatial_shape=(H, W)."
+                )
+        else:
+            H, W = spatial_shape
+            if H * W != N:
+                raise ValueError(
+                    f"spatial_shape {spatial_shape} does not match N={N}."
+                )
+
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=device, dtype=dtype),
+            torch.linspace(-1, 1, W, device=device, dtype=dtype),
+            indexing="ij"
+        )
+
+        dist = torch.sqrt(xx ** 2 + yy ** 2 + 1e-6)
+        theta = torch.atan2(yy, xx)
+
+        pos = torch.stack(
+            [
+                xx,
+                yy,
+                dist,
+                torch.sin(theta),
+                torch.cos(theta)
+            ],
+            dim=-1
+        )  # [H, W, 5]
+
+        pos = pos.view(1, N, 5).expand(B, -1, -1)  # [B, N, 5]
+
+        return x + self.gamma * self.proj(pos)
+
 class TVAttention(nn.Module):
+    """
+    Improved MSVA / TVAttention module.
 
+    Improvements:
+    1. Uses text/word features as query and visual tokens as key/value.
+    2. Introduces fine-grained and coarse-grained hierarchical visual tokens.
+    3. Adds lightweight spatial-azimuth encoding with gamma=0 initialization.
+    4. Keeps the original MSVA output and fuses the enhanced branch through a residual gate.
 
-    def __init__(self, encoder_dim, embed_dim, attention_dim, text_dim=1000):
+    Inputs:
+        TextFeature:
+            Global text feature, preferably decoder hidden state h_t.
+            Shape: [B, text_dim]
+
+        wordFeature:
+            Word-level feature, preferably previous word embedding e(y_{t-1}).
+            Shape: [B, embed_dim]
+
+        VisionFeature:
+            HDAF visual tokens.
+            Shape: [B, N, encoder_dim], e.g. [B, 196, 1024]
+            Also supports [B, H, W, encoder_dim] or [B, encoder_dim, H, W].
+
+    Output:
+        fused feature: [B, encoder_dim]
+    """
+
+    def __init__(
+            self,
+            encoder_dim,
+            embed_dim,
+            attention_dim,
+            text_dim=1000,
+            num_heads=8,
+            dropout=0.1
+    ):
         super(TVAttention, self).__init__()
 
+        assert encoder_dim % 2 == 0, "encoder_dim must be divisible by 2."
+        assert attention_dim % num_heads == 0, "attention_dim must be divisible by num_heads."
 
-        assert encoder_dim % 2 == 0, "encoder_dim必须是偶数"
-        self.half_dim = encoder_dim // 2
+        self.encoder_dim = encoder_dim
+        self.embed_dim = embed_dim
         self.attention_dim = attention_dim
+        self.text_dim = text_dim
 
+        half_dim = encoder_dim // 2
 
-        self.text_proj = nn.Sequential(
-            nn.Linear(text_dim, attention_dim),
-            nn.LayerNorm(attention_dim),
-            nn.GELU(),  # 比ReLU更平滑
-            nn.Dropout(0.1)
-        )
+        # =========================================================
+        # Original MSVA branch: keep the original behavior
+        # =========================================================
 
-
-        self.word_proj = nn.Sequential(
-            nn.Linear(embed_dim, attention_dim),
-            nn.LayerNorm(attention_dim),
-            nn.GELU()
-        )
-
-
-        self.vision_enhance = nn.Sequential(
-            nn.Linear(self.half_dim, self.half_dim),
-            nn.LayerNorm(self.half_dim),
-            nn.GELU(),
-            nn.Dropout(0.1)
-        )
-
-
-        self.text_align = nn.Linear(attention_dim, self.half_dim) if attention_dim != self.half_dim else nn.Identity()
-        self.word_align = nn.Linear(attention_dim, self.half_dim) if attention_dim != self.half_dim else nn.Identity()
-
-
-        self.text_guided_attn = nn.MultiheadAttention(
-            embed_dim=self.half_dim,
-            num_heads=4,
-            dropout=0.1,
+        self.text_to_vision = nn.MultiheadAttention(
+            half_dim,
+            num_heads=num_heads,
+            dropout=dropout,
             batch_first=True
         )
 
-
-        self.word_guided_attn = nn.MultiheadAttention(
-            embed_dim=self.half_dim,
-            num_heads=4,
-            dropout=0.1,
+        self.word_to_vision = nn.MultiheadAttention(
+            half_dim,
+            num_heads=num_heads,
+            dropout=dropout,
             batch_first=True
         )
 
+        self.text_proj = nn.Linear(text_dim, half_dim)
+        self.word_proj = nn.Linear(embed_dim, half_dim)
 
-        self.channel_attn = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            nn.Conv1d(self.half_dim, self.half_dim // 8, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(self.half_dim // 8, self.half_dim, 1),
-            nn.Sigmoid()
-        )
+        self.orig_norm_v1 = nn.LayerNorm(half_dim)
+        self.orig_norm_v2 = nn.LayerNorm(half_dim)
+        self.orig_norm_text = nn.LayerNorm(half_dim)
+        self.orig_norm_word = nn.LayerNorm(half_dim)
 
-
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(encoder_dim * 2, encoder_dim),  # 输入原始+处理后的特征
-            nn.LayerNorm(encoder_dim),
-            nn.Sigmoid()
-        )
-
-
-        self.output = nn.Sequential(
+        self.gate_net = nn.Sequential(
             nn.Linear(encoder_dim, encoder_dim),
-            nn.LayerNorm(encoder_dim),
-            nn.Dropout(0.1)
+            nn.Sigmoid()
         )
 
+        self.ffn = nn.Sequential(
+            nn.Linear(encoder_dim, encoder_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(encoder_dim * 4, encoder_dim)
+        )
 
-        self.temperature = nn.Parameter(torch.tensor(0.07))
+        self.norm3 = nn.LayerNorm(encoder_dim)
 
-    def forward(self, TextFeature, wordFeature, VisionFeature):
+        # =========================================================
+        # Enhanced MSVA branch
+        # =========================================================
+
+        # Visual projection
+        self.enh_vision_proj = nn.Linear(encoder_dim, attention_dim)
+
+        # Spatial-azimuth encoding
+        self.spatial_azimuth = SpatialAzimuthTokenEncoding(attention_dim)
+
+        # Text and word query projections
+        self.enh_text_query_proj = nn.Linear(text_dim, attention_dim)
+        self.enh_word_query_proj = nn.Linear(embed_dim, attention_dim)
+
+        self.enh_query_norm = nn.LayerNorm(attention_dim)
+        self.enh_vision_norm = nn.LayerNorm(attention_dim)
+
+        # Global semantic-guided visual attention
+        self.global_text_to_vision = nn.MultiheadAttention(
+            attention_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # Word-level semantic-guided visual attention
+        self.word_semantic_to_vision = nn.MultiheadAttention(
+            attention_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # Project enhanced semantic-visual feature back to encoder_dim
+        self.enh_out_proj = nn.Linear(attention_dim * 2, encoder_dim)
+
+        # Visual residual summary
+        self.enh_visual_residual = nn.Linear(encoder_dim, encoder_dim)
+
+        # Gate inside enhanced branch
+        self.enh_gate_net = nn.Sequential(
+            nn.Linear(encoder_dim * 2 + text_dim + embed_dim, encoder_dim),
+            nn.Sigmoid()
+        )
+
+        self.enh_norm1 = nn.LayerNorm(encoder_dim)
+        self.enh_norm2 = nn.LayerNorm(encoder_dim)
+
+        self.enh_ffn = nn.Sequential(
+            nn.Linear(encoder_dim, encoder_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(encoder_dim * 4, encoder_dim)
+        )
+
+        # =========================================================
+        # Residual fusion between original branch and enhanced branch
+        # =========================================================
+
+        self.residual_gate = nn.Sequential(
+            nn.Linear(encoder_dim * 2 + text_dim + embed_dim, encoder_dim),
+            nn.Sigmoid()
+        )
+
+        # gamma=0 makes the whole module initially equivalent to the original MSVA branch
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+        self.dropout = nn.Dropout(dropout)
+
+    def _to_tokens(self, VisionFeature):
         """
-        Forward propagation.
-        :param TextFeature: text feature, tensor of dimension (batch_size, text_dim)
-        :param wordFeature: word embedding, tensor of dimension (batch_size, embed_dim)
-        :param VisionFeature: encoded images, tensor of dimension (batch_size, num_pixels, encoder_dim)
-        :return: attention weighted encoding, tensor of dimension (batch_size, encoder_dim)
+        Convert visual feature to [B, N, C].
+
+        Supports:
+            [B, N, C]
+            [B, H, W, C]
+            [B, C, H, W]
         """
-        batch_size, num_pixels, _ = VisionFeature.shape
+        if VisionFeature.dim() == 3:
+            B, N, C = VisionFeature.shape
+            if C != self.encoder_dim:
+                raise ValueError(
+                    f"Expected encoder_dim={self.encoder_dim}, but got C={C}."
+                )
 
+            H = int(math.sqrt(N))
+            W = H if H * H == N else None
+            spatial_shape = (H, W) if W is not None else None
 
+            return VisionFeature, spatial_shape
+
+        elif VisionFeature.dim() == 4:
+            # Case 1: [B, H, W, C]
+            if VisionFeature.shape[-1] == self.encoder_dim:
+                B, H, W, C = VisionFeature.shape
+                tokens = VisionFeature.view(B, H * W, C).contiguous()
+                return tokens, (H, W)
+
+            # Case 2: [B, C, H, W]
+            elif VisionFeature.shape[1] == self.encoder_dim:
+                B, C, H, W = VisionFeature.shape
+                tokens = VisionFeature.flatten(2).transpose(1, 2).contiguous()
+                return tokens, (H, W)
+
+            else:
+                raise ValueError(
+                    "For 4D VisionFeature, expected shape [B, H, W, C] "
+                    "or [B, C, H, W]."
+                )
+
+        else:
+            raise ValueError(
+                "VisionFeature must be a 3D or 4D tensor."
+            )
+
+    def _build_hierarchical_tokens(self, fine_tokens, spatial_shape):
+        """
+        Build fine + coarse hierarchical visual tokens.
+
+        Fine tokens:
+            original visual tokens, e.g. 14 × 14 = 196 tokens.
+
+        Coarse tokens:
+            pooled visual tokens, e.g. 7 × 7 = 49 tokens.
+
+        Args:
+            fine_tokens: [B, N, D]
+            spatial_shape: (H, W)
+
+        Returns:
+            hierarchical tokens: [B, N + N_c, D]
+        """
+        B, N, D = fine_tokens.shape
+
+        if spatial_shape is None:
+            H = int(math.sqrt(N))
+            W = H
+            if H * W != N:
+                raise ValueError(
+                    f"Cannot infer spatial shape from N={N}."
+                )
+        else:
+            H, W = spatial_shape
+
+        fine_2d = fine_tokens.transpose(1, 2).contiguous().view(B, D, H, W)
+
+        coarse_h = max(1, H // 2)
+        coarse_w = max(1, W // 2)
+
+        coarse_2d = F.adaptive_avg_pool2d(
+            fine_2d,
+            output_size=(coarse_h, coarse_w)
+        )
+
+        coarse_tokens = coarse_2d.flatten(2).transpose(1, 2).contiguous()
+
+        hierarchical_tokens = torch.cat(
+            [fine_tokens, coarse_tokens],
+            dim=1
+        )
+
+        return hierarchical_tokens
+
+    def _original_branch(self, TextFeature, wordFeature, VisionFeature):
+        """
+        Original MSVA branch.
+
+        This branch is preserved to reduce the risk of performance degradation.
+        """
         vision1, vision2 = torch.chunk(VisionFeature, chunks=2, dim=2)
-        # vision1, vision2: (batch, num_pixels, half_dim)
 
+        text_embed = self.text_proj(TextFeature).unsqueeze(1)
+        word_embed = self.word_proj(wordFeature).unsqueeze(1)
 
-        text_proj = self.text_proj(TextFeature)  # (batch, attention_dim)
-        text_query = text_proj.unsqueeze(1)  # (batch, 1, attention_dim)
-        text_query_aligned = self.text_align(text_query)  # (batch, 1, half_dim)
+        vision1_norm = self.orig_norm_v1(vision1)
+        text_norm = self.orig_norm_text(text_embed)
 
+        attn_output1, attn_weights1 = self.text_to_vision(
+            query=vision1_norm,
+            key=text_norm,
+            value=text_norm
+        )
 
-        vision1_enhanced = self.vision_enhance(vision1)  # (batch, num_pixels, half_dim)
+        vision1_refined = vision1 + self.dropout(attn_output1)
 
+        vision2_norm = self.orig_norm_v2(vision2)
+        word_norm = self.orig_norm_word(word_embed)
 
-        vision1_attn, attn_weights = self.text_guided_attn(
-            query=text_query_aligned,
-            key=vision1_enhanced,
-            value=vision1
-        )  # (batch, 1, half_dim)
+        attn_output2, attn_weights2 = self.word_to_vision(
+            query=vision2_norm,
+            key=word_norm,
+            value=word_norm
+        )
 
+        vision2_refined = vision2 + self.dropout(attn_output2)
 
-        vision1_mean = vision1.mean(dim=1)  # (batch, half_dim)
-        vision1_out = 0.7 * vision1_mean + 0.3 * vision1_attn.squeeze(1)
+        vision1_pooled = vision1_refined.mean(dim=1)
+        vision2_pooled = vision2_refined.mean(dim=1)
 
+        combined = torch.cat(
+            [vision1_pooled, vision2_pooled],
+            dim=-1
+        )
 
-        word_proj = self.word_proj(wordFeature).unsqueeze(1)  # (batch, 1, attention_dim)
-        word_query_aligned = self.word_align(word_proj)  # (batch, 1, half_dim)
+        gate = self.gate_net(combined)
+        gated_feature = combined * gate
 
+        normalized = self.norm3(gated_feature)
+        ffn_output = self.ffn(normalized)
 
-        channel_weight = self.channel_attn(vision2.transpose(1, 2)).transpose(1, 2)
-        vision2_enhanced = vision2 * channel_weight  # (batch, num_pixels, half_dim)
+        output = gated_feature + self.dropout(ffn_output)
 
+        return output, {
+            "orig_text_attn": attn_weights1,
+            "orig_word_attn": attn_weights2
+        }
 
-        vision2_attn, _ = self.word_guided_attn(
-            query=word_query_aligned,
-            key=vision2_enhanced,
-            value=vision2_enhanced
-        )  # (batch, 1, half_dim)
+    def _enhanced_branch(self, TextFeature, wordFeature, VisionFeature, spatial_shape):
+        """
+        Enhanced MSVA branch.
 
+        Text/word features are used as queries.
+        Visual tokens are used as keys and values.
+        """
+        # Visual projection
+        visual_tokens = self.enh_vision_proj(VisionFeature)  # [B, N, D]
 
-        vision2_mean = vision2.mean(dim=1)  # (batch, half_dim)
-        vision2_out = 0.6 * vision2_mean + 0.4 * vision2_attn.squeeze(1)
+        # Spatial-azimuth encoding
+        visual_tokens = self.spatial_azimuth(
+            visual_tokens,
+            spatial_shape=spatial_shape
+        )
 
+        # Fine-grained visual tokens
+        fine_tokens = self.enh_vision_norm(visual_tokens)
 
-        vision_concat = torch.cat([vision1_out, vision2_out], dim=1)  # (batch, encoder_dim)
+        # Fine + coarse hierarchical tokens
+        hierarchical_tokens = self._build_hierarchical_tokens(
+            visual_tokens,
+            spatial_shape=spatial_shape
+        )
 
+        hierarchical_tokens = self.enh_vision_norm(hierarchical_tokens)
 
-        vision_raw = VisionFeature.mean(dim=1)  # (batch, encoder_dim)
-        gate_input = torch.cat([vision_concat, vision_raw], dim=1)  # (batch, encoder_dim * 2)
-        gate = self.fusion_gate(gate_input)  # (batch, encoder_dim)
+        # Text query: decoder hidden state h_t
+        text_query = self.enh_text_query_proj(TextFeature).unsqueeze(1)
+        text_query = self.enh_query_norm(text_query)
 
-        vision_fused = gate * vision_concat + (1 - gate) * vision_raw
+        # Word query: previous word embedding e(y_{t-1})
+        word_query = self.enh_word_query_proj(wordFeature).unsqueeze(1)
+        word_query = self.enh_query_norm(word_query)
 
+        # Global text-guided attention over hierarchical visual tokens
+        global_context, global_attn = self.global_text_to_vision(
+            query=text_query,
+            key=hierarchical_tokens,
+            value=hierarchical_tokens
+        )
 
-        output = self.output(vision_fused)  # (batch, encoder_dim)
+        # Word-level attention over fine-grained visual tokens
+        word_context, word_attn = self.word_semantic_to_vision(
+            query=word_query,
+            key=fine_tokens,
+            value=fine_tokens
+        )
+
+        global_context = global_context.squeeze(1)
+        word_context = word_context.squeeze(1)
+
+        semantic_visual = torch.cat(
+            [global_context, word_context],
+            dim=-1
+        )
+
+        candidate = self.enh_out_proj(semantic_visual)
+
+        visual_residual = self.enh_visual_residual(
+            VisionFeature.mean(dim=1)
+        )
+
+        enh_gate_input = torch.cat(
+            [
+                candidate,
+                visual_residual,
+                TextFeature,
+                wordFeature
+            ],
+            dim=-1
+        )
+
+        enh_gate = self.enh_gate_net(enh_gate_input)
+
+        enhanced_output = enh_gate * candidate + (1.0 - enh_gate) * visual_residual
+
+        enhanced_output = self.enh_norm1(enhanced_output)
+
+        enhanced_output = enhanced_output + self.dropout(
+            self.enh_ffn(self.enh_norm2(enhanced_output))
+        )
+
+        return enhanced_output, {
+            "global_attn": global_attn,
+            "word_attn": word_attn,
+            "enh_gate": enh_gate
+        }
+
+    def forward(
+            self,
+            TextFeature,
+            wordFeature,
+            VisionFeature,
+            spatial_shape=None,
+            return_attn=False
+    ):
+        """
+        Args:
+            TextFeature:
+                Global text feature, preferably decoder hidden state h_t.
+                Shape: [B, text_dim]
+
+            wordFeature:
+                Word-level feature, preferably previous word embedding e(y_{t-1}).
+                Shape: [B, embed_dim]
+
+            VisionFeature:
+                Visual feature from HDAF.
+                Shape: [B, N, encoder_dim], [B, H, W, encoder_dim], or [B, encoder_dim, H, W]
+
+            spatial_shape:
+                Optional spatial shape (H, W). For 224 × 224 input images, usually (14, 14).
+
+            return_attn:
+                Whether to return attention maps and gates.
+
+        Returns:
+            output:
+                [B, encoder_dim]
+        """
+        VisionFeature, inferred_shape = self._to_tokens(VisionFeature)
+
+        if spatial_shape is None:
+            spatial_shape = inferred_shape
+
+        original_output, original_info = self._original_branch(
+            TextFeature,
+            wordFeature,
+            VisionFeature
+        )
+
+        enhanced_output, enhanced_info = self._enhanced_branch(
+            TextFeature,
+            wordFeature,
+            VisionFeature,
+            spatial_shape=spatial_shape
+        )
+
+        residual_gate_input = torch.cat(
+            [
+                original_output,
+                enhanced_output,
+                TextFeature,
+                wordFeature
+            ],
+            dim=-1
+        )
+
+        residual_gate = self.residual_gate(residual_gate_input)
+
+        # Important:
+        # gamma is initialized as 0, so the module initially behaves exactly like the original MSVA branch.
+        output = original_output + self.gamma * residual_gate * self.dropout(enhanced_output)
+
+        if return_attn:
+            info = {}
+            info.update(original_info)
+            info.update(enhanced_info)
+            info["residual_gate"] = residual_gate
+            info["gamma"] = self.gamma.detach()
+
+            return output, info
 
         return output
 
